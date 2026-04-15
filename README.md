@@ -10,10 +10,9 @@ Create a conda env's with TUI
 
 - Python 3.8+
 - Conda available in `PATH`
+- [Trogon](https://github.com/Textualize/trogon)
 
 ## Quick setup
-
-From this directory (`bin/python/`):
 
 ```bash
 python3 -m venv venv
