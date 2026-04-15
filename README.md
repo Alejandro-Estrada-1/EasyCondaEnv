@@ -42,8 +42,8 @@ python3 conda_env_tui.py --name bio --file envs/structural_biology.txt --dry-run
 
 `conda_env_tui.py` is a wrapper around `conda create` with two interfaces:
 
-1. **TUI mode** (Text User Interface) when `trogon` is installed.
-2. **Interactive CLI mode** when `trogon` is not available.
+1. **TUI mode** (Text User Interface) when [trogon](https://github.com/Textualize/trogon) is installed.
+2. **Interactive CLI mode** when [trogon](https://github.com/Textualize/trogon) is not available.
 
 Execution flow:
 
@@ -59,7 +59,7 @@ Execution flow:
 5. Runs Conda and streams output in real time.
 6. Prints the proper activation command at the end.
 
-If `trogon` is missing, the script still works in CLI mode and shows a hint to install optional UI dependencies.
+If [trogon](https://github.com/Textualize/trogon) is missing, the script still works in CLI mode and shows a hint to install optional UI dependencies.
 
 ### Why `requirements.txt` is still needed
 
@@ -87,5 +87,5 @@ Without this step, TUI mode will not be available.
 
 ## Notes
 
-- If `trogon` is not installed, the script automatically falls back to interactive CLI mode.
+- If [trogon](https://github.com/Textualize/trogon) is not installed, the script automatically falls back to interactive CLI mode.
 - The `venv/` folder is local development state and should not be versioned.
