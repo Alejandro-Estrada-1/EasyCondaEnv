@@ -715,6 +715,10 @@ def _run_textual_wizard():
             border: round $primary;
         }
 
+        #main_form {
+            overflow-y: auto;
+        }
+
         #main_preview {
             border: round $success;
         }
@@ -759,8 +763,8 @@ def _run_textual_wizard():
         """
 
         BINDINGS = [
-            Binding("ctrl+p", "open_package_selector", "Packages"),
-            Binding("ctrl+r", "create_environment", "Create"),
+            Binding("ctrl+o", "open_package_selector", "Packages"),
+            Binding("ctrl+c", "create_environment", "Create"),
             Binding("ctrl+q", "quit_wizard", "Quit"),
         ]
 
@@ -775,7 +779,7 @@ def _run_textual_wizard():
             yield Horizontal(
                 Vertical(
                     Static("Main interface"),
-                    Static("Use Ctrl+P for package selector, Ctrl+R to create, Ctrl+Q to exit."),
+                    Static("Use Ctrl+O for package selector, Ctrl+C to create, Ctrl+Q to exit."),
                     Input(placeholder="Environment name", id="name_input"),
                     Input(placeholder="Environment prefix path", id="prefix_input"),
                     Input(placeholder="Python version (example: 3.11)", id="python_input"),
