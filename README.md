@@ -56,7 +56,13 @@ python3 conda_env_tui.py --name bio --file envs/structural_biology.txt --dry-run
 
 ### Package selector screen (second interface)
 
-From the main TUI, open the package selector using `Ctrl+P` (or the button).
+From the main TUI, open the package selector using `Ctrl+O` (or the button).
+
+Main wizard shortcuts:
+
+- `Ctrl+O`: open package selector.
+- `Ctrl+C`: create environment.
+- `Ctrl+Q`: exit wizard.
 
 - Left panel: search results as `package version` (build strings are intentionally hidden).
 - Right panel: selected package versions.
@@ -120,6 +126,7 @@ Without this step, TUI mode will not be available.
 
 - If [trogon](https://github.com/Textualize/trogon) is not installed, the script automatically falls back to interactive CLI mode.
 - In the package selector, search runs asynchronously to keep the interface responsive.
+- In small screens, the main interface panel is scrollable so action buttons remain reachable.
 - The `venv/` folder is local development state and should not be versioned.
 
 > [!IMPORTANT]
