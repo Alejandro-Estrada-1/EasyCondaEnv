@@ -17,6 +17,7 @@ import json
 import importlib
 import threading
 import queue
+import time
 from dataclasses import dataclass
 from pathlib import Path
 import click
@@ -37,6 +38,12 @@ except ImportError:
 
 
 TEXTUAL_UNAVAILABLE = object()
+SEARCH_CACHE_TTL_SECONDS = 24 * 60 * 60
+SEARCH_CACHE_MAX_ENTRIES = 200
+SEARCH_CACHE_FILE = Path.home() / ".cache" / "easycondaenv" / "search_cache_v1.json"
+SEARCH_CACHE_LOCK = threading.Lock()
+SEARCH_CACHE_LOADED = False
+SEARCH_CACHE = {}
 
 
 @dataclass
@@ -68,6 +75,170 @@ class CondaCreateConfig:
     yes: bool = True
     dry_run: bool = False
     packages: tuple = ()
+
+
+def _build_search_cache_key(pattern, channels, use_full_name):
+    """Build deterministic cache key for a search request.
+
+    Args:
+        pattern: Query pattern used in ``conda search``.
+        channels: Channels included in the request.
+        use_full_name: Whether ``--full-name`` was applied.
+
+    Returns:
+        str: Serialized key string.
+    """
+
+    payload = {
+        "pattern": pattern,
+        "channels": list(channels),
+        "use_full_name": bool(use_full_name),
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _load_search_cache_once():
+    """Load persistent search cache file once per process."""
+
+    global SEARCH_CACHE_LOADED
+
+    with SEARCH_CACHE_LOCK:
+        if SEARCH_CACHE_LOADED:
+            return
+
+        SEARCH_CACHE_LOADED = True
+        if not SEARCH_CACHE_FILE.exists():
+            return
+
+        try:
+            raw = SEARCH_CACHE_FILE.read_text(encoding="utf-8")
+            data = json.loads(raw)
+        except (OSError, json.JSONDecodeError):
+            return
+
+        if not isinstance(data, dict):
+            return
+
+        entries = data.get("entries", {})
+        if not isinstance(entries, dict):
+            return
+
+        for key, value in entries.items():
+            if not isinstance(value, dict):
+                continue
+            timestamp = value.get("timestamp")
+            results = value.get("results")
+            if not isinstance(timestamp, (int, float)):
+                continue
+            if not isinstance(results, list):
+                continue
+
+            parsed_results = []
+            for item in results:
+                if (
+                    isinstance(item, (list, tuple))
+                    and len(item) == 2
+                    and isinstance(item[0], str)
+                    and isinstance(item[1], str)
+                ):
+                    parsed_results.append((item[0], item[1]))
+
+            SEARCH_CACHE[key] = {
+                "timestamp": float(timestamp),
+                "results": parsed_results,
+            }
+
+
+def _save_search_cache_locked():
+    """Persist cache to disk. Caller must hold ``SEARCH_CACHE_LOCK``."""
+
+    try:
+        SEARCH_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "entries": {
+                key: {
+                    "timestamp": value["timestamp"],
+                    "results": value["results"],
+                }
+                for key, value in SEARCH_CACHE.items()
+            }
+        }
+        SEARCH_CACHE_FILE.write_text(json.dumps(payload), encoding="utf-8")
+    except OSError:
+        # Cache persistence is best-effort and should never break searches.
+        return
+
+
+def _prune_search_cache_locked():
+    """Remove expired/old entries. Caller must hold ``SEARCH_CACHE_LOCK``."""
+
+    now = time.time()
+    expired_keys = []
+    for key, value in SEARCH_CACHE.items():
+        timestamp = value.get("timestamp", 0)
+        if (now - timestamp) > SEARCH_CACHE_TTL_SECONDS:
+            expired_keys.append(key)
+
+    for key in expired_keys:
+        SEARCH_CACHE.pop(key, None)
+
+    if len(SEARCH_CACHE) <= SEARCH_CACHE_MAX_ENTRIES:
+        return
+
+    ordered = sorted(
+        SEARCH_CACHE.items(),
+        key=lambda item: item[1].get("timestamp", 0),
+        reverse=True,
+    )
+    keep = dict(ordered[:SEARCH_CACHE_MAX_ENTRIES])
+    SEARCH_CACHE.clear()
+    SEARCH_CACHE.update(keep)
+
+
+def _get_cached_search_result(cache_key, allow_stale=False):
+    """Return cached search results for a cache key.
+
+    Args:
+        cache_key: Request cache key.
+        allow_stale: Whether to allow entries older than TTL.
+
+    Returns:
+        tuple[list[tuple[str, str]] | None, float | None]:
+            Cached results and age in seconds, when available.
+    """
+
+    _load_search_cache_once()
+    with SEARCH_CACHE_LOCK:
+        entry = SEARCH_CACHE.get(cache_key)
+
+    if not entry:
+        return None, None
+
+    timestamp = float(entry.get("timestamp", 0))
+    age_seconds = max(0.0, time.time() - timestamp)
+    if not allow_stale and age_seconds > SEARCH_CACHE_TTL_SECONDS:
+        return None, None
+
+    results = entry.get("results") or []
+    return list(results), age_seconds
+
+
+def _set_cached_search_result(cache_key, results):
+    """Store search results in memory and persistent cache.
+
+    Args:
+        cache_key: Request cache key.
+        results: Search results to cache.
+    """
+
+    _load_search_cache_once()
+    with SEARCH_CACHE_LOCK:
+        SEARCH_CACHE[cache_key] = {
+            "timestamp": time.time(),
+            "results": list(results),
+        }
+        _prune_search_cache_locked()
+        _save_search_cache_locked()
 
 
 def _validate_solver(ctx, param, value):
@@ -269,6 +440,12 @@ def _search_conda_packages(query, channels):
 
     errors = []
     for pattern, use_full_name in attempts:
+        cache_key = _build_search_cache_key(pattern, channels, use_full_name)
+        cached_results, cache_age = _get_cached_search_result(cache_key, allow_stale=False)
+        if cached_results is not None:
+            age_minutes = int(cache_age // 60) if cache_age is not None else 0
+            return cached_results, f"Loaded from cache ({age_minutes} min old)."
+
         cmd = ["conda", "search", "--json"]
         if use_full_name:
             cmd.append("--full-name")
@@ -286,6 +463,13 @@ def _search_conda_packages(query, channels):
                 timeout=30,
             )
         except subprocess.TimeoutExpired:
+            stale_results, stale_age = _get_cached_search_result(cache_key, allow_stale=True)
+            if stale_results is not None:
+                age_hours = int(stale_age // 3600) if stale_age is not None else 0
+                return stale_results, (
+                    "Search timed out after 30 seconds. "
+                    f"Showing stale cache ({age_hours} h old)."
+                )
             return [], "Search timed out after 30 seconds. Try a more specific name."
 
         payload = (completed.stdout or "").strip()
@@ -339,6 +523,7 @@ def _search_conda_packages(query, channels):
         entries.sort(key=lambda item: _version_sort_key(item[1]), reverse=True)
         entries.sort(key=lambda item: item[0].lower())
         if entries:
+            _set_cached_search_result(cache_key, entries)
             return entries, ""
 
     if errors:
@@ -635,7 +820,10 @@ def _run_textual_wizard():
             self._refresh_results_list()
 
             if error:
-                self._set_status(f"Search error: {error}")
+                if results:
+                    self._set_status(f"Found {len(results)} package versions. {error}")
+                else:
+                    self._set_status(f"Search error: {error}")
             else:
                 self._set_status(f"Found {len(results)} package versions.")
 
