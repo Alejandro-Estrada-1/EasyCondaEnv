@@ -18,6 +18,7 @@ import importlib
 import threading
 import queue
 import time
+from difflib import SequenceMatcher
 from dataclasses import dataclass
 from pathlib import Path
 import click
@@ -44,6 +45,16 @@ SEARCH_CACHE_FILE = Path.home() / ".cache" / "easycondaenv" / "search_cache_v1.j
 SEARCH_CACHE_LOCK = threading.Lock()
 SEARCH_CACHE_LOADED = False
 SEARCH_CACHE = {}
+PACKAGE_VERSION_DISPLAY_LIMIT = 15
+LOCAL_PACKAGE_INDEX_MAX_VERSIONS = 60
+LOCAL_PACKAGE_INDEX_BUILD_TIMEOUT_SECONDS = 240
+LOCAL_PACKAGE_INDEX_CACHE_FILE = Path.home() / ".cache" / "easycondaenv" / "lista_reducida.txt"
+LOCAL_PACKAGE_INDEX_LOCK = threading.Lock()
+LOCAL_PACKAGE_INDEX_LOADED = False
+LOCAL_PACKAGE_INDEX_SOURCE = ""
+LOCAL_PACKAGE_VERSIONS = {}
+LOCAL_PACKAGE_INDEX_BUILD_LOCK = threading.Lock()
+LOCAL_PACKAGE_INDEX_BUILD_IN_PROGRESS = False
 
 
 @dataclass
@@ -95,6 +106,411 @@ def _build_search_cache_key(pattern, channels, use_full_name):
         "use_full_name": bool(use_full_name),
     }
     return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _local_package_index_candidates():
+    """Return candidate plain-text files that can seed package index.
+
+    The expected text format is line-based and supports either:
+    - ``name version ...``
+    - ``channel/subdir::name version ...``
+
+    Returns:
+        tuple[Path, ...]: Candidate files in priority order.
+    """
+
+    script_dir = Path(__file__).resolve().parent
+    candidates = [
+        LOCAL_PACKAGE_INDEX_CACHE_FILE,
+        Path.cwd() / "lista_reducida.txt",
+        Path.cwd() / "lista.txt",
+        script_dir / "lista_reducida.txt",
+        script_dir / "lista.txt",
+    ]
+
+    unique = []
+    seen = set()
+    for path in candidates:
+        resolved = str(path)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique.append(path)
+
+    return tuple(unique)
+
+
+def _load_local_package_index_once():
+    """Load package versions from a local text index file once per process."""
+
+    global LOCAL_PACKAGE_INDEX_LOADED
+    global LOCAL_PACKAGE_INDEX_SOURCE
+    global LOCAL_PACKAGE_VERSIONS
+
+    with LOCAL_PACKAGE_INDEX_LOCK:
+        if LOCAL_PACKAGE_INDEX_LOADED:
+            return
+
+        LOCAL_PACKAGE_INDEX_LOADED = True
+
+        for candidate in _local_package_index_candidates():
+            if not candidate.is_file():
+                continue
+
+            parsed = {}
+            try:
+                with candidate.open("r", encoding="utf-8", errors="ignore") as handle:
+                    for raw_line in handle:
+                        line = raw_line.strip()
+                        if not line:
+                            continue
+
+                        lowered = line.lower()
+                        if lowered.startswith("loading channels"):
+                            continue
+
+                        parts = line.split()
+                        if len(parts) < 2:
+                            continue
+
+                        name = parts[0].strip()
+                        if "::" in name:
+                            name = name.split("::", 1)[1].strip()
+
+                        version = parts[1].strip()
+                        if not name or not version:
+                            continue
+
+                        if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", name):
+                            continue
+
+                        versions = parsed.setdefault(name, set())
+                        versions.add(version)
+            except OSError:
+                continue
+
+            if not parsed:
+                continue
+
+            normalized = {}
+            for package_name, versions in parsed.items():
+                ordered = sorted(versions, key=_version_sort_key, reverse=True)
+                normalized[package_name] = ordered[:LOCAL_PACKAGE_INDEX_MAX_VERSIONS]
+
+            LOCAL_PACKAGE_VERSIONS = normalized
+            LOCAL_PACKAGE_INDEX_SOURCE = str(candidate)
+            return
+
+
+def _extract_name_version_from_conda_search_line(line):
+    """Extract package ``(name, version)`` from a plain-text conda search row.
+
+    Args:
+        line: Raw output line from ``conda search``.
+
+    Returns:
+        tuple[str, str] | None: Extracted package tuple or ``None``.
+    """
+
+    stripped = (line or "").strip()
+    if not stripped:
+        return None
+
+    lowered = stripped.lower()
+    if lowered.startswith("loading channels"):
+        return None
+
+    parts = stripped.split()
+    if len(parts) < 2:
+        return None
+
+    name = parts[0].strip()
+    version = parts[1].strip()
+
+    if "::" in name:
+        name = name.split("::", 1)[1].strip()
+
+    if name.lower() == "name" and version.lower() == "version":
+        return None
+
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", name):
+        return None
+
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$", version):
+        return None
+
+    return name, version
+
+
+def _build_local_package_index(channels):
+    """Build local package index file from conda search output.
+
+    Args:
+        channels: Channel list used to generate the index.
+
+    Notes:
+        This is best-effort and should never interrupt normal search flow.
+    """
+
+    cmd = ["conda", "search"]
+    for channel in channels:
+        cmd.extend(["--channel", channel])
+
+    target_file = LOCAL_PACKAGE_INDEX_CACHE_FILE
+    temp_file = target_file.with_suffix(".tmp")
+
+    try:
+        target_file.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+
+    process = None
+    rows_written = 0
+
+    try:
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+
+        assert process.stdout is not None
+        started_at = time.time()
+
+        with temp_file.open("w", encoding="utf-8") as handle:
+            for line in process.stdout:
+                if (time.time() - started_at) > LOCAL_PACKAGE_INDEX_BUILD_TIMEOUT_SECONDS:
+                    process.kill()
+                    return
+
+                pair = _extract_name_version_from_conda_search_line(line)
+                if pair is None:
+                    continue
+
+                handle.write(f"{pair[0]} {pair[1]}\n")
+                rows_written += 1
+
+        return_code = process.wait(timeout=5)
+        if return_code != 0 or rows_written == 0:
+            return
+
+        temp_file.replace(target_file)
+
+        # Force reload so this new file is picked up by the next query.
+        global LOCAL_PACKAGE_INDEX_LOADED
+        global LOCAL_PACKAGE_INDEX_SOURCE
+        global LOCAL_PACKAGE_VERSIONS
+        with LOCAL_PACKAGE_INDEX_LOCK:
+            LOCAL_PACKAGE_INDEX_LOADED = False
+            LOCAL_PACKAGE_INDEX_SOURCE = ""
+            LOCAL_PACKAGE_VERSIONS = {}
+    except (OSError, subprocess.SubprocessError):
+        return
+    finally:
+        try:
+            if process is not None and process.poll() is None:
+                process.kill()
+        except OSError:
+            pass
+        try:
+            if temp_file.exists():
+                temp_file.unlink()
+        except OSError:
+            pass
+
+
+def _start_async_local_package_index_build(channels):
+    """Start one-shot background build for local package index.
+
+    Args:
+        channels: Channels to pass to ``conda search`` while generating index.
+    """
+
+    local_versions, _ = _get_local_package_versions()
+    if local_versions:
+        return
+
+    global LOCAL_PACKAGE_INDEX_BUILD_IN_PROGRESS
+
+    with LOCAL_PACKAGE_INDEX_BUILD_LOCK:
+        if LOCAL_PACKAGE_INDEX_BUILD_IN_PROGRESS:
+            return
+        LOCAL_PACKAGE_INDEX_BUILD_IN_PROGRESS = True
+
+    def _worker():
+        try:
+            _build_local_package_index(channels)
+        finally:
+            global LOCAL_PACKAGE_INDEX_BUILD_IN_PROGRESS
+            with LOCAL_PACKAGE_INDEX_BUILD_LOCK:
+                LOCAL_PACKAGE_INDEX_BUILD_IN_PROGRESS = False
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def _get_local_package_versions():
+    """Return package versions loaded from optional local text index.
+
+    Returns:
+        tuple[dict[str, list[str]], str]: Mapping and source file path.
+    """
+
+    _load_local_package_index_once()
+    with LOCAL_PACKAGE_INDEX_LOCK:
+        return LOCAL_PACKAGE_VERSIONS, LOCAL_PACKAGE_INDEX_SOURCE
+
+
+def _merge_name_versions(target, name, versions, max_versions_per_name):
+    """Merge versions into a ``name -> versions`` map with dedup and cap.
+
+    Args:
+        target: Destination mapping.
+        name: Package name key.
+        versions: Iterable of versions to merge.
+        max_versions_per_name: Per-package cap.
+    """
+
+    if not name:
+        return
+
+    bucket = target.setdefault(name, [])
+    seen = set(bucket)
+    for version in versions:
+        if not version or version in seen:
+            continue
+        seen.add(version)
+        bucket.append(version)
+
+    bucket.sort(key=_version_sort_key, reverse=True)
+    if len(bucket) > max_versions_per_name:
+        del bucket[max_versions_per_name:]
+
+
+def _build_known_package_versions(max_versions_per_name=LOCAL_PACKAGE_INDEX_MAX_VERSIONS):
+    """Collect known package versions from local index and search cache.
+
+    Args:
+        max_versions_per_name: Per-package version cap.
+
+    Returns:
+        dict[str, list[str]]: Known package names mapped to versions.
+    """
+
+    known = {}
+
+    local_versions, _ = _get_local_package_versions()
+    for package_name, versions in local_versions.items():
+        _merge_name_versions(known, package_name, versions, max_versions_per_name)
+
+    _load_search_cache_once()
+    with SEARCH_CACHE_LOCK:
+        cache_entries = list(SEARCH_CACHE.values())
+
+    for entry in cache_entries:
+        results = entry.get("results") or []
+        for item in results:
+            if (
+                isinstance(item, (list, tuple))
+                and len(item) == 2
+                and isinstance(item[0], str)
+                and isinstance(item[1], str)
+            ):
+                _merge_name_versions(known, item[0], (item[1],), max_versions_per_name)
+
+    return known
+
+
+def _fuzzy_match_package_names(query, package_names, limit=120):
+    """Return ranked fuzzy package-name matches for a query.
+
+    Args:
+        query: Raw user query.
+        package_names: Candidate package names.
+        limit: Maximum matches to return.
+
+    Returns:
+        list[str]: Ranked package names.
+    """
+
+    normalized_query = (query or "").strip().lower()
+    if not normalized_query:
+        return []
+
+    compact_query = re.sub(r"[-_.]+", "", normalized_query)
+    scored = []
+
+    for package_name in package_names:
+        lowered = package_name.lower()
+        if lowered == normalized_query:
+            score = 1000
+        elif lowered.startswith(normalized_query):
+            score = 930 - min(len(lowered) - len(normalized_query), 60)
+        elif normalized_query in lowered:
+            score = 840 - min(lowered.index(normalized_query), 60)
+        else:
+            # Quick filter to skip distant candidates before costly ratio checks.
+            if abs(len(lowered) - len(normalized_query)) > 8 and lowered[:1] != normalized_query[:1]:
+                continue
+
+            compact_name = re.sub(r"[-_.]+", "", lowered)
+            ratio = SequenceMatcher(None, compact_query, compact_name).ratio()
+            if ratio < 0.62:
+                continue
+            score = int(ratio * 700)
+
+        scored.append((score, package_name))
+
+    scored.sort(key=lambda item: (-item[0], item[1].lower()))
+    return [name for _, name in scored[:limit]]
+
+
+def _entries_from_name_versions(name_versions, ordered_names):
+    """Build ``(name, version)`` entries from ordered package names.
+
+    Args:
+        name_versions: Mapping of package names to version lists.
+        ordered_names: Package names in desired display order.
+
+    Returns:
+        list[tuple[str, str]]: Flat ``(name, version)`` entries.
+    """
+
+    entries = []
+    for name in ordered_names:
+        versions = name_versions.get(name, [])
+        for version in versions:
+            entries.append((name, version))
+    return entries
+
+
+def _search_local_package_index(query):
+    """Search package names from optional local text index.
+
+    Args:
+        query: Package query.
+
+    Returns:
+        tuple[list[tuple[str, str]], str]: Entries and status message.
+    """
+
+    local_versions, source = _get_local_package_versions()
+    if not local_versions:
+        return [], ""
+
+    query_lower = query.lower()
+    exact_names = [name for name in local_versions.keys() if name.lower() == query_lower]
+    if exact_names:
+        entries = _entries_from_name_versions(local_versions, exact_names)
+        return entries, f"Loaded from local index ({source})."
+
+    matched_names = _fuzzy_match_package_names(query, local_versions.keys(), limit=120)
+    if not matched_names:
+        return [], ""
+
+    entries = _entries_from_name_versions(local_versions, matched_names)
+    return entries, f"Showing fuzzy matches from local index ({source})."
 
 
 def _load_search_cache_once():
@@ -438,6 +854,17 @@ def _search_conda_packages(query, channels):
     if any(char in search_query for char in "*?[]"):
         attempts = [(search_query, False)]
 
+    # On first machine usage without local list, build it in background.
+    _start_async_local_package_index_build(channels)
+
+    # Fastest path: if a pre-generated local package index exists, search it first.
+    if attempts == [(search_query, True)]:
+        local_entries, local_message = _search_local_package_index(search_query)
+        if local_entries:
+            cache_key = _build_search_cache_key(search_query, channels, True)
+            _set_cached_search_result(cache_key, local_entries)
+            return local_entries, local_message
+
     errors = []
     for pattern, use_full_name in attempts:
         cache_key = _build_search_cache_key(pattern, channels, use_full_name)
@@ -525,6 +952,13 @@ def _search_conda_packages(query, channels):
         if entries:
             _set_cached_search_result(cache_key, entries)
             return entries, ""
+
+    known_versions = _build_known_package_versions()
+    fuzzy_names = _fuzzy_match_package_names(search_query, known_versions.keys(), limit=120)
+    if fuzzy_names:
+        fuzzy_entries = _entries_from_name_versions(known_versions, fuzzy_names)
+        if fuzzy_entries:
+            return fuzzy_entries, "No exact match. Showing approximate package names."
 
     if errors:
         return [], errors[-1]
@@ -699,7 +1133,9 @@ def _run_textual_wizard():
             super().__init__()
             self.selected_pairs = list(selected_pairs)
             self.channels = tuple(channels)
-            self.search_results = []
+            self.package_names = []
+            self.package_versions = {}
+            self.visible_versions = []
             self.search_in_progress = False
             self.search_queue = queue.Queue()
 
@@ -713,14 +1149,19 @@ def _run_textual_wizard():
                 Button("Search", id="pkg_search_btn", variant="primary"),
                 Horizontal(
                     Vertical(
-                        Static("Results: name + version (no build)"),
-                        ListView(id="pkg_results_list"),
-                        id="pkg_left_panel",
+                        Static("Packages"),
+                        ListView(id="pkg_packages_list"),
+                        id="pkg_packages_panel",
+                    ),
+                    Vertical(
+                        Static("Versions (up to 15)"),
+                        ListView(id="pkg_versions_list"),
+                        id="pkg_versions_panel",
                     ),
                     Vertical(
                         Static("Selected packages"),
                         ListView(id="pkg_selected_list"),
-                        id="pkg_right_panel",
+                        id="pkg_selected_panel",
                     ),
                     id="pkg_lists",
                 ),
@@ -733,7 +1174,7 @@ def _run_textual_wizard():
             """Set initial focus and start polling for async search results."""
             self.query_one("#pkg_search_input", Input).focus()
             self._refresh_selected_list()
-            self._set_status("Use Enter on a result to add it. Use Delete on right list to remove.")
+            self._set_status("Search package names, pick a package, then pick a version to add.")
             self.set_interval(0.2, self._drain_search_queue)
 
         def _set_status(self, message):
@@ -753,14 +1194,40 @@ def _run_textual_wizard():
             for child in list(list_widget.children):
                 child.remove()
 
-        def _refresh_results_list(self):
-            """Render search results in the left panel."""
-            list_widget = self.query_one("#pkg_results_list", ListView)
+        def _refresh_packages_list(self):
+            """Render package names in the package panel."""
+            list_widget = self.query_one("#pkg_packages_list", ListView)
             self._clear_list(list_widget)
-            for name, version in self.search_results:
-                list_widget.append(ListItem(Label(f"{name} {version}")))
+            for package_name in self.package_names:
+                list_widget.append(ListItem(Label(package_name)))
 
-            if self.search_results:
+            if self.package_names:
+                list_widget.index = 0
+
+            self._refresh_versions_list()
+
+        def _selected_package_name(self):
+            """Return package name selected in the package list."""
+            list_widget = self.query_one("#pkg_packages_list", ListView)
+            if list_widget.index is None:
+                return ""
+            index = int(list_widget.index)
+            if index < 0 or index >= len(self.package_names):
+                return ""
+            return self.package_names[index]
+
+        def _refresh_versions_list(self):
+            """Render versions for selected package in the versions panel."""
+            package_name = self._selected_package_name()
+            versions = self.package_versions.get(package_name, [])[:PACKAGE_VERSION_DISPLAY_LIMIT]
+            self.visible_versions = list(versions)
+
+            list_widget = self.query_one("#pkg_versions_list", ListView)
+            self._clear_list(list_widget)
+            for version in self.visible_versions:
+                list_widget.append(ListItem(Label(version)))
+
+            if self.visible_versions:
                 list_widget.index = 0
 
         def _refresh_selected_list(self):
@@ -816,30 +1283,51 @@ def _run_textual_wizard():
             """
             self.search_in_progress = False
             self.query_one("#pkg_search_btn", Button).disabled = False
-            self.search_results = results
-            self._refresh_results_list()
+
+            grouped = {}
+            for name, version in results:
+                versions = grouped.setdefault(name, [])
+                if version not in versions:
+                    versions.append(version)
+
+            for versions in grouped.values():
+                versions.sort(key=_version_sort_key, reverse=True)
+
+            self.package_versions = grouped
+            self.package_names = list(grouped.keys())
+            self._refresh_packages_list()
+
+            package_count = len(self.package_names)
+            version_count = sum(len(versions) for versions in self.package_versions.values())
 
             if error:
                 if results:
-                    self._set_status(f"Found {len(results)} package versions. {error}")
+                    self._set_status(
+                        f"Found {package_count} packages and {version_count} versions. {error}"
+                    )
                 else:
                     self._set_status(f"Search error: {error}")
             else:
-                self._set_status(f"Found {len(results)} package versions.")
+                self._set_status(f"Found {package_count} packages and {version_count} versions.")
 
-        def _add_current_result(self):
-            """Add currently selected search result to the selected list."""
-            list_widget = self.query_one("#pkg_results_list", ListView)
-            if list_widget.index is None:
-                self._set_status("No result selected.")
+        def _add_current_version(self):
+            """Add selected package/version pair to the selected list."""
+            package_name = self._selected_package_name()
+            if not package_name:
+                self._set_status("No package selected.")
                 return
 
-            index = int(list_widget.index)
-            if index < 0 or index >= len(self.search_results):
-                self._set_status("Invalid result index.")
+            versions_list = self.query_one("#pkg_versions_list", ListView)
+            if versions_list.index is None:
+                self._set_status("No version selected.")
                 return
 
-            pair = self.search_results[index]
+            version_index = int(versions_list.index)
+            if version_index < 0 or version_index >= len(self.visible_versions):
+                self._set_status("Invalid version index.")
+                return
+
+            pair = (package_name, self.visible_versions[version_index])
             if pair not in self.selected_pairs:
                 self.selected_pairs.append(pair)
                 self._refresh_selected_list()
@@ -884,8 +1372,10 @@ def _run_textual_wizard():
 
         def on_list_view_selected(self, event):
             """Handle Enter/selection actions from list widgets."""
-            if event.list_view.id == "pkg_results_list":
-                self._add_current_result()
+            if event.list_view.id == "pkg_packages_list":
+                self._refresh_versions_list()
+            elif event.list_view.id == "pkg_versions_list":
+                self._add_current_version()
 
     class CondaWizardApp(App):
         """Main TUI wizard for environment options and command preview."""
@@ -935,7 +1425,7 @@ def _run_textual_wizard():
             margin-top: 1;
         }
 
-        #pkg_left_panel, #pkg_right_panel {
+        #pkg_packages_panel, #pkg_versions_panel, #pkg_selected_panel {
             width: 1fr;
             height: 1fr;
             border: round $primary;

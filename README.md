@@ -64,9 +64,11 @@ Main wizard shortcuts:
 - `Ctrl+C`: create environment.
 - `Ctrl+Q`: exit wizard.
 
-- Left panel: search results as `package version` (build strings are intentionally hidden).
+- Left panel: package names.
+- Middle panel: versions for the selected package (up to 15, newest first).
 - Right panel: selected package versions.
-- `Enter` on a left result adds it to the right list.
+- `Enter` on a package refreshes the versions panel.
+- `Enter` on a version adds `package=version` to the selected list.
 - `Delete` on the right list removes the selected package.
 - `Ctrl+B` returns to the main screen.
 
@@ -76,6 +78,21 @@ Search behavior:
 - Supports wildcards only when explicitly provided (for example `numpy*`).
 - Results are de-duplicated by `(name, version)`.
 - Versions are sorted from newest to oldest.
+- Includes fuzzy package-name matching for typos/approximate text.
+- If a local package list file exists (`lista_reducida.txt` or `lista.txt`), it is used first for very fast first-search responses.
+- If no local list exists, the first search starts a background one-shot index build and saves it to user cache (`~/.cache/easycondaenv/lista_reducida.txt`) for future instant searches.
+
+Local index format notes:
+
+- Supported line formats include either `name version ...` or `channel/subdir::name version ...`.
+- Example generation:
+
+```bash
+conda search -c conda-forge -c bioconda > lista.txt
+tr -s ' ' < lista.txt | cut -d ' ' -f 1,2 > lista_reducida.txt
+```
+
+You do not need to commit these files to the repository. The app can auto-generate a local index per machine.
 
 > [!TIP]
 > For fastest results, start with an exact package name (for example `numpy`). Use wildcards only when needed.
