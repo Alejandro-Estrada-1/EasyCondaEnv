@@ -1165,6 +1165,7 @@ def _run_textual_wizard():
                     ),
                     id="pkg_lists",
                 ),
+                Button("Done", id="pkg_done_btn", variant="success"),
                 Static("", id="pkg_status"),
                 id="pkg_root",
             )
@@ -1360,10 +1361,16 @@ def _run_textual_wizard():
             """Return to main screen, passing selected package versions back."""
             self.dismiss(tuple(self.selected_pairs))
 
+        def action_done(self):
+            """Visual alias for returning to the main screen."""
+            self.action_back_to_main()
+
         def on_button_pressed(self, event):
             """Handle selector button actions."""
             if event.button.id == "pkg_search_btn":
                 self._search()
+            elif event.button.id == "pkg_done_btn":
+                self.action_done()
 
         def on_input_submitted(self, event):
             """Trigger search when user submits query input."""
@@ -1461,7 +1468,11 @@ def _run_textual_wizard():
                     Input(placeholder="Environment name", id="name_input"),
                     Input(placeholder="Environment prefix path", id="prefix_input"),
                     Input(placeholder="Python version (example: 3.11)", id="python_input"),
-                    Input(placeholder="Channels (space/comma separated)", id="channels_input"),
+                    Input(
+                        placeholder="Channels (space/comma separated)",
+                        value="bioconda conda-forge",
+                        id="channels_input",
+                    ),
                     Input(placeholder="Spec files (comma/newline separated)", id="files_input"),
                     Input(placeholder="Solver: classic or libmamba", id="solver_input"),
                     Input(placeholder="Extra package specs (space/comma separated)", id="manual_packages_input"),
